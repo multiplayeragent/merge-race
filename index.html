@@ -144,7 +144,8 @@ function livePlayers() {
   }
   return out.sort();
 }
-const isHost = () => livePlayers()[0] === net.sessionId;
+let wakeHold = 0; // a tab whose frames stopped (frozen, or in the background) doesn't act as host, nor for 700ms after it wakes (see frame())
+const isHost = () => livePlayers()[0] === net.sessionId && performance.now() >= wakeHold && !(last && performance.now() - last > 1000);
 const humans = () => livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
 
 // ── BOARD ───────────────────────────────────────────────────────────────────────────
@@ -628,6 +629,7 @@ let lastHb = 0, lastHud = 0, last = 0;
 function frame() {
   requestAnimationFrame(frame);
   const t = performance.now(), dt = Math.max(0, Math.min(0.05, (t - (last || t)) / 1000));
+  if (last && t - last > 1000) { wakeHold = t + 700; host.was = false; host.last = null; } // woke from a freeze or a background tab: another player may have run the race meanwhile, so let their state arrive, then adopt it like a new host
   last = t;
   if (t - lastHb > 1000) { lastHb = t; net.me.set("hb", Date.now()); fixColor(); }
   if (isHost()) hostTick(Date.now(), t); else host.was = false;
