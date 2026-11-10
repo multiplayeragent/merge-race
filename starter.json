@@ -1,0 +1,21 @@
+{
+  "name": "Merge Race",
+  "genre": "puzzle",
+  "dim": "2D",
+  "mode": "Versus",
+  "players": "2–4",
+  "hook": "Same tiles for everyone. First to 512 wins.",
+  "how": "Slide every tile at once; two equal numbers merge into their sum. Everyone starts from the same board and gets the same new tiles in the same order, so the race is pure skill. First to 512 wins, or the best tile when the 2:30 clock runs out.",
+  "controls": "Arrow keys or WASD, or swipe (drag with the mouse)",
+  "uses": [
+    ["Live sync", "Every rival's board slides next to yours, move by move."],
+    ["Host-run rounds", "The host's browser runs the race: the clock, who reached 512 first and the restart. If it leaves, the next player takes over."],
+    ["Bots", "Bots fill empty seats and race you with a corner strategy."],
+    ["Leaderboard", "Each player's best race score."]
+  ],
+  "ideas": [
+    "Make the target 2048 with a 5-minute clock",
+    "Add a power-up that swaps two tiles",
+    "Turn the numbers into fruit that grow when they merge"
+  ]
+}

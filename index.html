@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Merge Race</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #14122b; }
+  body { font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #f4f1ff; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  [hidden] { display: none !important; }
+  .hud { position: fixed; pointer-events: none; text-shadow: 0 1px 3px #000a; }
+  #net { bottom: max(10px, env(safe-area-inset-bottom)); left: max(12px, env(safe-area-inset-left)); font-size: 12px; opacity: .7; }
+  #hint { right: max(16px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); text-align: right; font-size: 13px; opacity: .85; max-width: 46vw; }
+  @media (max-aspect-ratio: 1/1) { #hint { left: 0; right: 0; max-width: none; text-align: center; bottom: max(30px, calc(env(safe-area-inset-bottom) + 24px)); padding: 0 12px; } }
+  #over { position: fixed; inset: 0; display: grid; place-items: center; background: #14122bc0; padding: 16px; }
+  .card { width: min(380px, calc(100vw - 32px)); max-height: 92vh; overflow: auto; box-sizing: border-box; padding: 20px; border-radius: 18px; background: #262150; border: 1px solid #ffffff22; text-align: center; box-shadow: 0 20px 60px #0009; }
+  .card h2 { margin: 0 0 6px; font-size: 26px; }
+  .card h3 { margin: 12px 0 0; font-size: 12px; letter-spacing: .1em; color: #b3a8e8; }
+  .card ol { text-align: left; margin: 8px 0; padding-left: 26px; font-size: 14px; } .card li span { float: right; } .card li.me { color: #ffd23f; font-weight: 700; }
+  button.go { width: 100%; min-height: 48px; border: 0; border-radius: 12px; background: #ffd23f; color: #262150; font: 800 17px system-ui, sans-serif; cursor: pointer; margin-top: 8px; }
+  #oNext { color: #b3a8e8; font-size: 13px; margin-top: 8px; }
+</style>
+<script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="safe" style="position:fixed;top:0;height:0;padding-top:env(safe-area-inset-top);pointer-events:none"></div>
+<div class="hud" id="hint"></div>
+<div class="hud" id="net">Connecting…</div>
+<div id="over" hidden><div class="card">
+  <h2 id="oTitle"></h2><ol id="places"></ol>
+  <h3>BEST SCORE IN ONE RACE</h3><ol id="board"><li>Loading the leaderboard…</li></ol>
+  <button class="go" id="again">Play again</button><div id="oNext"></div>
+</div></div>
+<script>
+/* ═══ MERGE RACE · a Multiplayer Agent starter ═══════════════════════════════════════════
+ * Slide tiles, merge equal numbers. Everyone gets the same tiles in the same order: first
+ * to 512 wins, or the best tile when time runs out. Versus, 2–4 players; bots fill seats.
+ *
+ * WHERE THINGS ARE (search for the "── " headers):
+ *   CONFIG ........ board size, the target tile, race length, bots
+ *   TILES ......... the color of each number
+ *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
+ *   BOARD ......... one board's rules: sliding, merging, the seeded new tiles, getting stuck
+ *   RACE (HOST) ... countdown, who reached the target first, the buzzer, the restart
+ *   BOTS (HOST) ... a bot keeps its big tiles in one corner, looks two moves ahead, ~2 moves a second
+ *   ME ............ my board: moves, publishing
+ *   RIVALS ........ other players' boards rebuilt from their snapshots, with sliding tiles
+ *   DRAW .......... boards (mine large, rivals small), the race clock, effects
+ *   SCREENS ....... sound, hint, results, leaderboard, colors
+ *   INPUT ......... arrow keys / WASD, swipe or drag
+ *   MAIN LOOP ..... heartbeat, host tick, my tick, draw
+ *
+ * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
+ *   - Each player's board is its OWN entity field `b` = {m, g, s, t, n, k, d, h}: race id,
+ *     the 16 cells as one string ("." empty, "a" = 2, "b" = 4, "c" = 8 … a letter per
+ *     doubling), score, best tile (as a power of 2), moves, new tiles so far, last move's
+ *     direction, and when it reached the target. Also `n` (name), `c` (color), `hb`.
+ *   - The HOST (lowest live sessionId) runs the race in ONE shared field, `race`: {id, v, ph,
+ *     seed, startAt, endsAt, players, bots, out, winner, nextAt, ready}. It watches every
+ *     board's best tile, calls the first to the target (or the best at the buzzer) and
+ *     restarts. Bots' boards live in the shared field `bots`.
+ *   - Same tiles for everyone: new tile number k comes from mulberry32(race.seed, k), so
+ *     every board starts the same and draws the same numbers in the same order.
+ *   - The clock is timestamps in `race` (startAt, endsAt), so a new host just carries on.
+ *   - ?attract plays offline with bots only, from a mid-race board (the preview video).
+ *   - Leaderboard "best-score": each player's best race score.
+ */
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  seats: 4,             // bots fill the race up to this many boards (2–4)
+  size: 4,              // the board is size × size
+  target: 512,          // first tile of this number wins (a power of 2)
+  raceMs: 150000,       // or the best tile wins when this runs out (2:30)
+  fourChance: 0.1,      // a new tile is a 4 this often, else a 2
+  slideMs: 90,          // tiles slide this long
+  jamMs: 900,           // a stuck board (no moves) waits this long, then sheds its smallest tiles
+  countdownMs: 3000,    // 3, 2, 1, go
+  overMs: 9000,         // the results screen
+  botMoveMs: 500,       // a bot slides about this often (lower is faster; 500 reaches 512 in ~2 min)
+  botMistake: 0.1,      // chance a bot plays its second-best move
+  board: "best-score",  // leaderboard name
+};
+const BOT_NAMES = ["Mergey", "Twofer", "Slider", "Doubles", "Tilly", "Corner Bot", "Stacks", "Binary"];
+const COLORS = ["#ffd23f", "#4cc9f0", "#f72585", "#80ed99", "#ff9f1c", "#b388ff", "#ff6b6b", "#00f5d4"];
+
+// ── TILES ───────────────────────────────────────────────────────────────────────────
+// TILE[e] = [background, text] for the tile 2^e. Past the list, the last one repeats.
+const TILE = [null, ["#ece8ff", "#3b3566"], ["#d9e4ff", "#2f3a66"], ["#ffbf69", "#4a2a00"], ["#ff9b54", "#fff"], ["#ff6b6b", "#fff"], ["#f03e5f", "#fff"],
+  ["#ffd23f", "#4a3500"], ["#80ed99", "#0f4a22"], ["#4cc9f0", "#08304a"], ["#9b5de5", "#fff"], ["#f15bb5", "#fff"], ["#00f5d4", "#06362f"]];
+const tileColors = (e) => TILE[Math.min(e, TILE.length - 1)];
+const N = CONFIG.size;
+const targetExp = () => Math.round(Math.log2(CONFIG.target));
+
+// ── CONNECTION ──────────────────────────────────────────────────────────────────────
+// The builder fills these in for this game. Downloaded from GitHub? Put your own pk_ key here.
+const MP_CONNECT = {
+  key: 'pk_REPLACE_ME',
+  room: 'merge-race',
+  endpoint: 'wss://live.multiplayeragent.com',
+  apiUrl: 'https://api.multiplayeragent.com',
+};
+const ATTRACT = new URLSearchParams(location.search).has("attract");
+
+/** Same shape as the SDK client, kept in this tab: offline play and ?attract. */
+function localRoom() {
+  const id = "local", state = { entities: { players: { [id]: {} } }, shared: {} }, subs = [];
+  let queued = false;
+  const emit = () => { if (!queued) { queued = true; queueMicrotask(() => { queued = false; subs.forEach((f) => f(state)); }); } };
+  const put = (o, k, v) => { if (typeof k === "object") Object.assign(o, k); else o[k] = v; emit(); };
+  return {
+    sessionId: id, state, offline: true,
+    me: { set: (k, v) => put(state.entities.players[id], k, v) },
+    setShared: (k, v) => put(state.shared, k, v),
+    onState: (f) => { subs.push(f); f(state); }, onJoin() {}, onLeave() {}, on() {}, send() {},
+    onDisconnect() {}, onReconnect() {}, leave: async () => {},
+  };
+}
+async function connect() {
+  if (ATTRACT || typeof MP === "undefined") return localRoom();
+  try {
+    const mp = await Promise.race([MP.join({ ...MP_CONNECT }), new Promise((_, no) => setTimeout(() => no(new Error("timed out")), 10000))]);
+    window.mp = mp; // the builder calls window.mp.leave() when the page closes
+    return mp;
+  } catch (e) {
+    console.warn("Playing offline:", e && e.message);
+    return localRoom();
+  }
+}
+const parse = (v, fb) => { if (typeof v !== "string") return fb; try { return JSON.parse(v); } catch { return fb; } };
+const memo = new Map();
+/** A JSON field (shared or a player's), parsed once per change. Read-only. */
+function cached(key, raw, fb) { const m = memo.get(key); if (m && m.raw === raw) return m.v; const v = parse(raw, fb); memo.set(key, { raw, v }); return v; }
+let net = null, S = { entities: { players: {} }, shared: {} };
+const seenHb = new Map();
+function livePlayers() {
+  const now = performance.now(), out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    const s = seenHb.get(id);
+    if (!s || s.hb !== p.hb) seenHb.set(id, { hb: p.hb, at: now });
+    if (id === net.sessionId || now - seenHb.get(id).at < 3000) out.push(id);
+  }
+  return out.sort();
+}
+const isHost = () => livePlayers()[0] === net.sessionId;
+const humans = () => livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
+
+// ── BOARD ───────────────────────────────────────────────────────────────────────────
+// g[row][col] holds the tile as a power of 2 (0 = empty, 1 = 2, 2 = 4, 3 = 8 …).
+// Directions: 0 left, 1 right, 2 up, 3 down.
+function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const DIRS = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+/** The i-th cell of a line, counting from the edge the tiles slide toward. */
+const cellOf = (dir, line, i) => (dir === 0 ? [line, i] : dir === 1 ? [line, N - 1 - i] : dir === 2 ? [i, line] : [N - 1 - i, line]);
+/** Slide every tile one way; equal neighbors merge once. Returns the new grid and what moved where. */
+function slide(grid, dir) {
+  const g = grid.map((row) => row.slice()), moves = [], merges = [];
+  let gained = 0, moved = false;
+  for (let line = 0; line < N; line++) {
+    const cells = Array.from({ length: N }, (_, i) => cellOf(dir, line, i)), vals = cells.map(([r, c]) => g[r][c]);
+    for (const [r, c] of cells) g[r][c] = 0;
+    let w = 0, canMerge = false;
+    for (let i = 0; i < N; i++) {
+      const v = vals[i];
+      if (!v) continue;
+      const from = cells[i];
+      if (canMerge && g[cells[w - 1][0]][cells[w - 1][1]] === v) {
+        const to = cells[w - 1];
+        g[to[0]][to[1]] = v + 1; gained += 2 ** (v + 1); merges.push([to[0], to[1], v + 1]); moves.push({ from, to, v });
+        canMerge = false; moved = true;
+      } else {
+        const to = cells[w++];
+        g[to[0]][to[1]] = v; moves.push({ from, to, v }); canMerge = true;
+        if (to[0] !== from[0] || to[1] !== from[1]) moved = true;
+      }
+    }
+  }
+  return { g, moves, merges, gained, moved };
+}
+const canMove = (g) => [0, 1, 2, 3].some((d) => slide(g, d).moved);
+const bestOfGrid = (g) => Math.max(0, ...g.flat());
+/** New tile number k: from the race seed, so every board draws the same numbers in the same order. */
+function spawn(B) {
+  const empty = [];
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (!B.g[r][c]) empty.push([r, c]);
+  const rnd = mulberry32((B.seed ^ Math.imul(B.k + 1, 0x9e3779b1)) >>> 0);
+  B.k++;
+  if (!empty.length) return null;
+  const v = rnd() < CONFIG.fourChance ? 2 : 1, [r, c] = empty[Math.floor(rnd() * empty.length)];
+  B.g[r][c] = v;
+  return [r, c, v];
+}
+function newBoard(seed, start) {
+  const B = { seed, g: Array.from({ length: N }, () => Array(N).fill(0)), score: 0, n: 0, k: 0, dir: -1, best: 0, reachedAt: 0, jamAt: 0, anim: null };
+  if (start) B.g = start.map((row) => row.slice());
+  else { spawn(B); spawn(B); }
+  B.best = bestOfGrid(B.g);
+  return B;
+}
+/** One move. Returns what happened (for effects), or null if nothing could slide that way. */
+function move(B, dir, now) {
+  if (B.jamAt) return null;
+  const res = slide(B.g, dir);
+  if (!res.moved) return null;
+  B.g = res.g; B.score += res.gained; B.n++; B.dir = dir;
+  const born = spawn(B), was = B.best;
+  B.best = bestOfGrid(B.g);
+  if (B.best >= targetExp() && !B.reachedAt) B.reachedAt = Date.now();
+  B.anim = { at: now, moves: res.moves, merges: res.merges, born };
+  if (!canMove(B.g)) B.jamAt = now + CONFIG.jamMs;
+  return { merges: res.merges, gained: res.gained, newBest: B.best > was ? B.best : 0 };
+}
+/** A stuck board sheds every tile of its smallest number, then play goes on. */
+function stepBoard(B, now) {
+  if (!B.jamAt || now < B.jamAt) return null;
+  const low = Math.min(...B.g.flat().filter((v) => v)), shed = [];
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (B.g[r][c] === low) { shed.push([r, c, low]); B.g[r][c] = 0; }
+  B.jamAt = 0; B.anim = null;
+  return { shed };
+}
+const LETTERS = ".abcdefghijklmnopq";
+/** A board as it goes on the wire: one short JSON string. */
+const packBoard = (B, m) => JSON.stringify({ m, g: B.g.flat().map((v) => LETTERS[v] || ".").join(""), s: B.score, t: B.best, n: B.n, k: B.k, d: B.dir, h: B.reachedAt, j: B.jamAt ? 1 : 0 });
+const unpackGrid = (str) => Array.from({ length: N }, (_, r) => Array.from({ length: N }, (_, c) => Math.max(0, LETTERS.indexOf(String(str || "")[r * N + c] || "."))));
+
+// ── RACE (HOST) ─────────────────────────────────────────────────────────────────────
+const host = { last: null, was: false, bots: new Map(), botsRaw: "", lastBots: 0 };
+function race() {
+  const m = cached("race", S.shared.race, null);
+  return host.last && isHost() && (!m || host.last.v > m.v) ? host.last : m;
+}
+function writeRace(m) { m = { ...m, v: (race()?.v ?? 0) + 1 }; host.last = m; net.setShared("race", JSON.stringify(m)); return m; }
+const nameOf = (m, id) => (id === net.sessionId ? myName : m?.bots.find((b) => b.i === id)?.n) || String(S.entities.players?.[id]?.n ?? "Player").slice(0, 12);
+const colorOf = (m, id) => (id === net.sessionId ? myColor : m?.bots.find((b) => b.i === id)?.c) || S.entities.players?.[id]?.c || "#aaa";
+const isBot = (m, id) => !!m && m.bots.some((b) => b.i === id);
+const newBot = (B) => ({ B, nextAt: 0, mistake: CONFIG.botMistake, pace: 1 });
+let startGrid = null; // ?attract starts every board from the same mid-race grid
+
+function newRace(id) {
+  const hs = humans().slice(0, CONFIG.seats), used = new Set(hs.map((h) => colorOf(null, h))), free = COLORS.filter((c) => !used.has(c)), names = [...BOT_NAMES].sort(() => Math.random() - 0.5);
+  const bots = Array.from({ length: Math.max(hs.length ? 0 : 1, CONFIG.seats - hs.length) }, (_, k) => ({ i: "bot" + (k + 1), n: names[k], c: free[k % free.length] }));
+  const seed = (Math.random() * 1e9) | 0, startAt = Date.now() + CONFIG.countdownMs;
+  host.bots = new Map(bots.map((b) => [b.i, newBot(newBoard(seed, startGrid))]));
+  if (ATTRACT) Object.assign(host.bots.get("bot1"), { mistake: 0, pace: 0.75 }); // the big board in the preview plays a little better
+  return { id, ph: "count", seed, startAt, endsAt: startAt + CONFIG.raceMs, players: [...hs, ...bots.map((b) => b.i)], bots, out: [], winner: "", nextAt: 0, ready: [] };
+}
+/** Become host: take the bots' boards over exactly as state has them. */
+function adopt() {
+  host.was = true; host.last = null; host.bots = new Map();
+  const m = race();
+  if (!m) return;
+  for (const v of cached("bots", S.shared.bots, [])) if (v.m === m.id) host.bots.set(v.i, newBot(boardFromView(v, m.seed)));
+  for (const b of m.bots) if (!host.bots.has(b.i)) host.bots.set(b.i, newBot(newBoard(m.seed, startGrid)));
+}
+function boardFromView(v, seed) {
+  const B = newBoard(seed, unpackGrid(v.g));
+  Object.assign(B, { score: v.s || 0, n: v.n || 0, k: v.k || 0, dir: v.d ?? -1, reachedAt: v.h || 0 });
+  if (!canMove(B.g)) B.jamAt = performance.now() + CONFIG.jamMs;
+  return B;
+}
+/** What this client knows of a board: live for itself (and the host's bots), the last snapshot for the rest. */
+function boardOf(m, id) {
+  if (isBot(m, id) && isHost()) { const B = host.bots.get(id)?.B; return B && { best: B.best, score: B.score, at: B.reachedAt }; }
+  if (isBot(m, id)) { const v = cached("bots", S.shared.bots, []).find((x) => x.i === id); return v && v.m === m.id ? { best: v.t || 0, score: v.s || 0, at: v.h || 0 } : null; }
+  if (id === net.sessionId) return me.B && me.m === m.id ? { best: me.B.best, score: me.B.score, at: me.B.reachedAt } : null;
+  const b = cached("b:" + id, S.entities.players?.[id]?.b, null);
+  return b && b.m === m.id ? { best: b.t || 0, score: b.s || 0, at: b.h || 0 } : null;
+}
+/** Best first: the target reached, earliest; then the best tile; then score. */
+function standings(m) {
+  const info = (id) => boardOf(m, id) || { best: 0, score: 0, at: 0 };
+  const key = (id) => { const b = info(id); return [b.best >= targetExp() ? 1 : 0, b.best >= targetExp() ? -b.at : 0, b.best, b.score]; };
+  return m.players.filter((id) => !m.out.includes(id)).sort((a, b) => { const ka = key(a), kb = key(b); for (let i = 0; i < 4; i++) if (ka[i] !== kb[i]) return kb[i] - ka[i]; return 0; });
+}
+/** One winner, or none on a dead heat (same best tile and score, nobody at the target). */
+function pickWinner(m) {
+  const order = standings(m), a = boardOf(m, order[0]), b = boardOf(m, order[1]);
+  if (!a) return "";
+  if (b && a.best === b.best && a.score === b.score && !(a.best >= targetExp() && a.at !== b.at)) return "";
+  return order[0];
+}
+function hostTick(nowMs, t) {
+  if (!host.was) adopt();
+  let m = race();
+  if (!m) m = writeRace(newRace(1));
+  if (m.ph === "count" && nowMs >= m.startAt) m = writeRace({ ...m, ph: "play" });
+  if (m.ph === "play") {
+    botsTick(m, t);
+    const live = new Set(livePlayers()), left = m.players.filter((id) => !isBot(m, id) && id !== net.sessionId && !m.out.includes(id) && !live.has(id));
+    if (left.length) m = writeRace({ ...m, out: [...m.out, ...left] }); // left, or frozen (no heartbeat for 3s)
+    const hadHumans = m.players.some((id) => !isBot(m, id)), humansIn = m.players.some((id) => !isBot(m, id) && !m.out.includes(id));
+    const done = m.players.some((id) => !m.out.includes(id) && (boardOf(m, id)?.best || 0) >= targetExp());
+    if (done || nowMs >= m.endsAt || (hadHumans && !humansIn)) writeRace({ ...m, ph: "over", winner: pickWinner(m), places: standings(m), nextAt: nowMs + CONFIG.overMs, ready: [] });
+  } else if (m.ph === "over" && nowMs >= m.nextAt) writeRace(newRace(m.id + 1));
+  writeBots();
+}
+function onReady(from) {
+  const m = race();
+  if (!m || m.ph !== "over" || m.ready.includes(from)) return;
+  const ready = [...m.ready, from];
+  writeRace({ ...m, ready, nextAt: humans().every((id) => ready.includes(id)) ? Math.min(m.nextAt, Date.now() + 1200) : m.nextAt });
+}
+
+// ── BOTS (HOST) ─────────────────────────────────────────────────────────────────────
+// A bot keeps its biggest tiles snaking along the top row from the left corner. For each
+// move it imagines a new 2 landing in each empty cell, then its best next move, and picks
+// the move that does best on average (a two-move look-ahead).
+const SNAKE = [[0, 1, 2, 3], [7, 6, 5, 4], [8, 9, 10, 11], [15, 14, 13, 12]];
+function rateGrid(g) {
+  let s = 0, empty = 0;
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) { if (g[r]?.[c]) s += 2 ** g[r][c] * 0.5 ** (SNAKE[r]?.[c] ?? 15); else empty++; }
+  return s * (1 + empty * 0.03);
+}
+function lookAhead(g) {
+  const empty = [];
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (!g[r][c]) empty.push([r, c]);
+  if (!empty.length) return rateGrid(g);
+  let total = 0;
+  for (const [r, c] of empty) {
+    g[r][c] = 1;
+    let best = rateGrid(g) * 0.05; // no move left after this tile: very bad
+    for (let d = 0; d < 4; d++) { const res = slide(g, d); if (res.moved) best = Math.max(best, rateGrid(res.g)); }
+    total += best; g[r][c] = 0;
+  }
+  return total / empty.length;
+}
+function botMove(bot) {
+  const options = [0, 1, 2, 3].map((d) => ({ d, res: slide(bot.B.g, d) })).filter((o) => o.res.moved);
+  if (!options.length) return -1;
+  for (const o of options) o.v = lookAhead(o.res.g);
+  options.sort((a, b) => b.v - a.v);
+  return (Math.random() < bot.mistake && options[1]) ? options[1].d : options[0].d; // a slip: the second-best move
+}
+function botsTick(m, t) {
+  for (const [id, bot] of host.bots) {
+    if (m.out.includes(id)) continue;
+    const B = bot.B, shed = stepBoard(B, t);
+    if (shed) afterStep(id, B, shed);
+    if (t < bot.nextAt || B.jamAt) continue;
+    bot.nextAt = t + CONFIG.botMoveMs * bot.pace * (0.6 + Math.random() * 0.8);
+    const d = botMove(bot), res = d >= 0 && move(B, d, t);
+    if (res) afterStep(id, B, res);
+  }
+}
+function writeBots() {
+  const now = performance.now(), m = race();
+  if (now - host.lastBots < 100 || !m) return; // ~10/s, and only when a bot board changed
+  host.lastBots = now;
+  const raw = JSON.stringify([...host.bots].map(([i, bot]) => ({ i, ...JSON.parse(packBoard(bot.B, m.id)) })));
+  if (raw !== host.botsRaw) { host.botsRaw = raw; net.setShared("bots", raw); }
+}
+
+// ── ME ──────────────────────────────────────────────────────────────────────────────
+const me = { m: 0, B: null, sent: "", lastSend: 0 };
+let myName = "", myColor = COLORS[0];
+try { myName = localStorage.getItem("mpa-name") || ""; } catch {}
+if (!myName) myName = ["Ace", "Pip", "Nova", "Ziggy", "Maple", "Taco"][Math.floor(Math.random() * 6)] + " " + (10 + Math.floor(Math.random() * 90));
+
+function myTick(m, t) {
+  if (m.id !== me.m) { me.m = m.id; me.B = m.players.includes(net.sessionId) ? newBoard(m.seed, startGrid) : null; publish(true); }
+  if (me.B && m.ph === "play") { const shed = stepBoard(me.B, t); if (shed) afterStep(net.sessionId, me.B, shed); }
+  publish(false);
+}
+const canPlay = () => { const m = race(); return !ATTRACT && m && m.ph === "play" && me.B && me.m === m.id && !m.out.includes(net.sessionId); };
+function myMove(dir) {
+  if (!canPlay()) return;
+  const res = move(me.B, dir, performance.now());
+  if (res) afterStep(net.sessionId, me.B, res); else tone(160, 50, "square", 0.02);
+}
+/** After any board moves: sounds and effects. */
+function afterStep(id, B, res) {
+  const mine = id === net.sessionId, now = performance.now();
+  if (res.merges) {
+    for (const [r, c, v] of res.merges) if (v >= 6) fx.bursts.push({ id, r, c, v, at: now });
+    if (res.newBest >= 7 && res.newBest < targetExp()) fx.texts.push({ id, text: `${2 ** res.newBest}!`, color: tileColors(res.newBest)[0], at: now });
+    if (mine) { if (res.merges.length) tone(330 * 2 ** (Math.max(...res.merges.map((x) => x[2])) / 12), 120, "triangle", 0.05); else tone(520, 30, "sine", 0.02); }
+  }
+  if (res.shed) { fx.texts.push({ id, text: "Stuck! Shaking off…", color: "#ff9b54", at: now }); for (const [r, c, v] of res.shed) fx.bursts.push({ id, r, c, v, at: now }); if (mine) tone(120, 300, "sawtooth", 0.05); }
+  if (mine) publish(true);
+}
+function publish(force) {
+  const now = performance.now(), m = race();
+  if (!m || (!force && now - me.lastSend < 66)) return; // ~15/s at most
+  const v = me.B ? packBoard(me.B, m.id) : JSON.stringify({ m: m.id, t: 0 });
+  if (v === me.sent) return;
+  me.sent = v; me.lastSend = now;
+  net.me.set("b", v);
+}
+
+// ── RIVALS ──────────────────────────────────────────────────────────────────────────
+// Other players' boards (and, on non-hosts, the bots') arrive as snapshots. When a snapshot
+// is exactly one move on from the last, that move is replayed here, so the tiles slide;
+// otherwise the changed tiles just pop in.
+const rivals = new Map();
+function rivalBoard(id, v, now) {
+  let R = rivals.get(id);
+  if (!R || R.m !== v.m) { R = { m: v.m, src: null, g: unpackGrid(v.g), n: v.n || 0, anim: null }; rivals.set(id, R); }
+  if (R.src !== v) { applySnapshot(id, R, v, now); R.src = v; }
+  return R;
+}
+function applySnapshot(id, R, v, now) {
+  const g = unpackGrid(v.g), was = R.best || 0;
+  let anim = null;
+  if ((v.n || 0) === R.n + 1 && v.d >= 0) {
+    const res = slide(R.g, v.d), diff = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (res.g[r][c] !== g[r][c]) diff.push([r, c, g[r][c]]);
+    if (diff.length <= 1 && (!diff.length || !res.g[diff[0][0]][diff[0][1]])) anim = { at: now, moves: res.moves, merges: res.merges, born: diff[0] || null };
+  }
+  if (!anim) { const born = []; for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (g[r][c] && g[r][c] !== R.g[r][c]) born.push([r, c, g[r][c]]); anim = { at: now - CONFIG.slideMs, moves: [], merges: born, born: null }; }
+  Object.assign(R, { g, anim, n: v.n || 0, score: v.s || 0, best: v.t || 0, reachedAt: v.h || 0, jamAt: v.j ? 1 : 0 });
+  if (R.best > was && R.best >= 7 && R.best < targetExp() && was) fx.texts.push({ id, text: `${2 ** R.best}!`, color: tileColors(R.best)[0], at: now });
+}
+
+// ── DRAW ────────────────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const cv = $("game"), ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1, SAFE_TOP = 0;
+function fit() { DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight; cv.width = W * DPR; cv.height = H * DPR; SAFE_TOP = parseFloat(getComputedStyle($("safe")).paddingTop) || 0; }
+addEventListener("resize", fit); addEventListener("orientationchange", fit); fit();
+const fx = { bursts: [], parts: [], texts: [], spots: new Map(), flash: 0 };
+const easeOut = (p) => 1 - (1 - p) ** 3;
+
+/** Everyone's board as this client sees it: mine and (on the host) the bots' live, the rest from snapshots. */
+function boardViews(m, now) {
+  const ps = S.entities.players || {}, botViews = isHost() ? null : new Map(cached("bots", S.shared.bots, []).map((v) => [v.i, v]));
+  return m.players.map((id) => {
+    let V = null, v = null;
+    if (id === net.sessionId && me.B && me.m === m.id) V = me.B;
+    else if (isBot(m, id) && !botViews) V = host.bots.get(id)?.B || null;
+    else v = isBot(m, id) ? botViews.get(id) : cached("b:" + id, ps[id]?.b, null);
+    if (!V && v && v.m === m.id && v.g) V = rivalBoard(id, v, now);
+    return { id, name: nameOf(m, id), color: colorOf(m, id), V, out: m.out.includes(id) };
+  });
+}
+/** Where each board goes: mine big, rivals small beside it (or above it on a tall screen). `s` = board width in pixels. */
+function layout(views) {
+  const mine = views.find((v) => v.id === net.sessionId && !ATTRACT) || views[0], others = views.filter((v) => v !== mine), n = Math.max(1, others.length), spots = new Map();
+  if (W >= H * 0.95) {
+    const big = Math.min(H - 170, W * 0.42), room = W - big - 110, small = Math.min((room - 26 * n) / n, H * 0.5, big * 0.6), total = big + 80 + n * (small + 26) - 26;
+    const x0 = Math.round((W - total) / 2);
+    spots.set(mine.id, { x: x0, y: Math.round((H - big) / 2) + 22, s: big, big: true });
+    others.forEach((v, i) => spots.set(v.id, { x: x0 + big + 80 + i * (small + 26), y: Math.round(H / 2 - small / 2) + 22, s: small }));
+  } else {
+    const small = Math.min((W - 32 - 18 * (n - 1)) / n, H * 0.17), top = SAFE_TOP + 30;
+    const big = Math.min(W - 40, H - top - small - 230), spare = Math.max(0, H - top - small - 110 - big - 170);
+    others.forEach((v, i) => spots.set(v.id, { x: Math.round((W - (n * small + (n - 1) * 18)) / 2 + i * (small + 18)), y: top, s: small }));
+    spots.set(mine.id, { x: Math.round((W - big) / 2), y: top + small + 110 + Math.round(spare / 2), s: big, big: true });
+  }
+  return spots;
+}
+function drawTile(x, y, size, e, scale = 1) {
+  if (!e) return;
+  const [bg, fg] = tileColors(e), s = size * scale, ox = x + (size - s) / 2, oy = y + (size - s) / 2, label = String(2 ** e);
+  if (e >= 7 && size > 30) { ctx.shadowColor = bg; ctx.shadowBlur = size * 0.3; }
+  ctx.fillStyle = bg; ctx.beginPath(); ctx.roundRect(ox, oy, s, s, s * 0.14); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#ffffff26"; ctx.beginPath(); ctx.roundRect(ox, oy, s, s * 0.45, [s * 0.14, s * 0.14, 0, 0]); ctx.fill();
+  ctx.fillStyle = fg; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = `900 ${s * (label.length <= 2 ? 0.46 : label.length === 3 ? 0.38 : 0.3)}px system-ui, sans-serif`;
+  ctx.fillText(label, ox + s / 2, oy + s * 0.53);
+  ctx.textBaseline = "alphabetic";
+}
+function drawBoard(view, sp, now, leader) {
+  const { V, color } = view, s = sp.s, cs = s / N, pad = cs * 0.07, ts = cs - pad * 2, x = sp.x, y = sp.y;
+  ctx.fillStyle = "#211d45"; ctx.beginPath(); ctx.roundRect(x - pad * 1.5, y - pad * 1.5, s + pad * 3, s + pad * 3, cs * 0.18); ctx.fill();
+  ctx.lineWidth = sp.big ? 3 : 2; ctx.strokeStyle = color; ctx.stroke();
+  ctx.fillStyle = "#2e2960";
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) { ctx.beginPath(); ctx.roundRect(x + c * cs + pad, y + r * cs + pad, ts, ts, ts * 0.14); ctx.fill(); }
+  if (V) {
+    const A = V.anim, k = A ? (now - A.at) / CONFIG.slideMs : 9;
+    if (A && k < 1) { // tiles sliding: draw each from where it was toward where it goes
+      const e = easeOut(Math.max(0, k));
+      for (const mv of A.moves) drawTile(x + (mv.from[1] + (mv.to[1] - mv.from[1]) * e) * cs + pad, y + (mv.from[0] + (mv.to[0] - mv.from[0]) * e) * cs + pad, ts, mv.v);
+    } else {
+      const pop = A ? Math.min(1, (now - A.at - CONFIG.slideMs) / 130) : 1;
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        const merged = A && A.merges.some(([mr, mc]) => mr === r && mc === c), born = A && A.born && A.born[0] === r && A.born[1] === c;
+        const sc = born ? 0.2 + 0.8 * easeOut(pop) : merged ? 1 + 0.18 * Math.sin(pop * Math.PI) : 1;
+        drawTile(x + c * cs + pad, y + r * cs + pad, ts, V.g[r][c], sc);
+      }
+    }
+    if (V.jamAt) { ctx.fillStyle = `rgba(255,120,80,${0.15 + 0.1 * Math.sin(now / 60)})`; ctx.fillRect(x, y, s, s); }
+  }
+  const best = V ? V.best : 0, won = best >= targetExp();
+  ctx.textAlign = "left"; ctx.fillStyle = color; ctx.font = `800 ${sp.big ? 16 : 11}px system-ui, sans-serif`;
+  const label = (view.id === net.sessionId ? "You" : view.name) + (leader ? " 👑" : "");
+  ctx.fillText(label, x - pad, y - pad * 1.5 - (sp.big ? 10 : 6));
+  ctx.textAlign = "right"; ctx.fillStyle = best ? tileColors(best)[0] : "#b3a8e8";
+  ctx.fillText(best ? (sp.big ? `best ${2 ** best}` : String(2 ** best)) : "", x + s + pad, y - pad * 1.5 - (sp.big ? 10 : 6));
+  ctx.fillStyle = "#d6cff7"; ctx.font = `600 ${sp.big ? 13 : 10}px system-ui, sans-serif`; ctx.textAlign = "center";
+  ctx.fillText(`${V ? V.score : 0} pts${sp.big ? ` · ${V ? V.n : 0} moves` : ""}`, x + s / 2, y + s + pad * 1.5 + (sp.big ? 20 : 13));
+  if (won || view.out) {
+    ctx.fillStyle = won ? "#14122b55" : "#14122bcc"; ctx.fillRect(x - pad * 1.5, y - pad * 1.5, s + pad * 3, s + pad * 3);
+    ctx.font = `900 ${Math.max(14, s * 0.16)}px system-ui, sans-serif`; ctx.lineWidth = Math.max(3, s * 0.02); ctx.strokeStyle = "#14122b";
+    if (won) ctx.strokeText(`${CONFIG.target}!`, x + s / 2, y + s / 2 + s * 0.05);
+    ctx.fillStyle = won ? "#ffd23f" : "#9a93c4"; ctx.fillText(won ? `${CONFIG.target}!` : "Left", x + s / 2, y + s / 2 + s * 0.05);
+  }
+}
+function drawBackground(now) {
+  const grd = ctx.createLinearGradient(0, 0, W, H); grd.addColorStop(0, "#211a4d"); grd.addColorStop(1, "#0d0b1f");
+  ctx.fillStyle = grd; ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 18; i++) { // faint tiles drifting past
+    const s = 14 + (i % 4) * 8, x = ((i * 0.6180339) % 1) * W, y = H + 40 - ((((i * 0.41) % 1) * (H + 80) + now * (0.01 + (i % 3) * 0.004)) % (H + 80));
+    ctx.fillStyle = `${tileColors(1 + (i % 9))[0]}14`; ctx.beginPath(); ctx.roundRect(x, y, s, s, s * 0.2); ctx.fill();
+  }
+}
+const fmt = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+function draw(m, now, dt) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground(now);
+  if (!m) return;
+  const views = boardViews(m, now), spots = layout(views), order = standings(m), a = boardOf(m, order[0]), b = boardOf(m, order[1]);
+  const lead = m.ph === "over" ? m.winner : a && (!b || a.best > b.best) ? order[0] : ""; // a crown only for a clear leader
+  fx.spots = spots;
+  for (const view of views) drawBoard(view, spots.get(view.id), now, view.id === lead);
+  const mine = [...spots.values()].find((sp) => sp.big), t = Date.now();
+  if (mine && m.ph !== "count") { // the race clock, over my board
+    const left = m.ph === "play" ? m.endsAt - t : 0, warn = m.ph === "play" && left < 10000;
+    ctx.textAlign = "center"; ctx.font = `900 ${mine.s > 300 ? 34 : 26}px system-ui, sans-serif`; ctx.fillStyle = warn ? (Math.floor(t / 250) % 2 ? "#ff6b6b" : "#fff") : "#fff";
+    ctx.fillText(m.ph === "play" ? fmt(left) : (boardOf(m, m.winner)?.best || 0) >= targetExp() ? "Finish!" : "Time!", mine.x + mine.s / 2, mine.y - (mine.big ? 52 : 40));
+    ctx.font = "700 13px system-ui, sans-serif"; ctx.fillStyle = "#b3a8e8"; ctx.fillText(`First to ${CONFIG.target} wins`, mine.x + mine.s / 2, mine.y - (mine.big ? 34 : 26));
+  }
+  for (const b of fx.bursts) if (!b.done) { // big merges and shed tiles burst
+    b.done = true;
+    const sp = spots.get(b.id); if (!sp) continue;
+    const cs = sp.s / N, cx = sp.x + (b.c + 0.5) * cs, cy = sp.y + (b.r + 0.5) * cs;
+    for (let i = 0; i < (sp.big ? 14 : 5); i++) { const a = Math.random() * Math.PI * 2, v = (sp.big ? 220 : 90) * (0.4 + Math.random()); fx.parts.push({ x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 80, life: 1, c: tileColors(b.v)[0], s: sp.big ? 5 : 3 }); }
+  }
+  fx.bursts = [];
+  for (let i = fx.parts.length - 1; i >= 0; i--) {
+    const p = fx.parts[i]; p.life -= dt * 1.6; p.vy += 500 * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.life <= 0) { fx.parts.splice(i, 1); continue; }
+    ctx.globalAlpha = p.life; ctx.fillStyle = p.c; ctx.fillRect(p.x - p.s / 2, p.y - p.s / 2, p.s, p.s);
+  }
+  ctx.globalAlpha = 1;
+  for (const tx of fx.texts) { // "256!" over the board that made it
+    const sp = spots.get(tx.id), k = (now - tx.at) / 1100;
+    if (!sp || k > 1) continue;
+    const size = Math.max(14, sp.s * (sp.big ? 0.12 : 0.16)) * (k < 0.15 ? 0.6 + k * 2.7 : 1);
+    ctx.globalAlpha = 1 - k * k; ctx.font = `900 ${size}px system-ui, sans-serif`; ctx.textAlign = "center"; ctx.lineWidth = 5; ctx.strokeStyle = "#14122b";
+    ctx.strokeText(tx.text, sp.x + sp.s / 2, sp.y + sp.s * 0.42 - k * 40); ctx.fillStyle = tx.color; ctx.fillText(tx.text, sp.x + sp.s / 2, sp.y + sp.s * 0.42 - k * 40);
+  }
+  ctx.globalAlpha = 1;
+  fx.texts = fx.texts.filter((x) => now - x.at < 1100);
+  if (m.ph === "count") { const n = Math.ceil((m.startAt - t) / 1000); big(n > 0 ? String(n) : "GO!", "#ffd23f"); }
+  else if (m.ph === "play" && t - m.startAt < 700) big("GO!", "#80ed99");
+  else if (m.ph === "play" && !m.players.includes(net.sessionId) && !ATTRACT) big("Watching", "#d6cff7", "You'll race in the next one", 36, SAFE_TOP + 60);
+}
+function big(text, color, sub, size = Math.min(96, W * 0.16), y = H * 0.45) {
+  ctx.textAlign = "center"; ctx.font = `900 ${size}px system-ui, sans-serif`;
+  ctx.lineWidth = 8; ctx.strokeStyle = "#14122b"; ctx.strokeText(text, W / 2, y); ctx.fillStyle = color; ctx.fillText(text, W / 2, y);
+  if (sub) { ctx.font = "700 15px system-ui, sans-serif"; ctx.lineWidth = 4; ctx.strokeText(sub, W / 2, y + 26); ctx.fillStyle = "#fff"; ctx.fillText(sub, W / 2, y + 26); }
+}
+
+// ── SCREENS ─────────────────────────────────────────────────────────────────────────
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+let AC = null;
+function unlockAudio() { if (!AC && !ATTRACT) try { AC = new AudioContext(); } catch {} }
+function tone(f, ms, type = "sine", vol = 0.05) {
+  if (!AC) return;
+  const o = AC.createOscillator(), gn = AC.createGain(), t = AC.currentTime;
+  o.type = type; o.frequency.value = f; gn.gain.setValueAtTime(vol, t); gn.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+  o.connect(gn).connect(AC.destination); o.start(t); o.stop(t + ms / 1000);
+}
+let overFor = -1, board = null;
+function hud(m) {
+  const n = humans().length;
+  $("net").textContent = ATTRACT ? "" : net.offline ? "Offline: playing with bots" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the race" : ""}`;
+  if (!m) return;
+  const early = m.ph === "count" || (m.ph === "play" && Date.now() - m.startAt < 14000 && m.id <= 2);
+  $("hint").textContent = ATTRACT || !early ? "" : touchUI ? `Swipe to slide every tile · equal numbers merge · first to ${CONFIG.target} wins` : `Arrow keys or WASD slide every tile · equal numbers merge · first to ${CONFIG.target} wins`;
+  $("over").hidden = m.ph !== "over" || ATTRACT;
+  if (m.ph !== "over") return;
+  const views = boardViews(m, performance.now()), V = (id) => views.find((x) => x.id === id)?.V, w = m.winner;
+  const place = [...(m.places || []), ...m.players.filter((id) => !(m.places || []).includes(id))];
+  $("oTitle").textContent = !w ? "Dead heat!" : (w === net.sessionId ? "You" : nameOf(m, w)) + ((V(w)?.best || 0) >= targetExp() ? ` reached ${CONFIG.target} first!` : w === net.sessionId ? " had the best tile!" : " had the best tile");
+  const html = place.map((id) => `<li class="${id === net.sessionId ? "me" : ""}">${esc(nameOf(m, id))}${m.out.includes(id) ? " (left)" : ""}<span>${V(id)?.best ? 2 ** V(id).best : 0} · ${V(id)?.score || 0} pts</span></li>`).join("");
+  if ($("places").innerHTML !== html) $("places").innerHTML = html;
+  $("oNext").textContent = `Next race in ${Math.max(0, Math.ceil((m.nextAt - Date.now()) / 1000))}s`;
+  $("again").textContent = m.ready.includes(net.sessionId) ? "Ready ✓" : "Play again";
+  if (overFor === m.id) return;
+  overFor = m.id;
+  const list = $("board"), score = me.B && me.m === m.id ? me.B.score : 0;
+  if (w === net.sessionId) tone(660, 400, "triangle", 0.07);
+  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
+  list.innerHTML = "<li>Loading…</li>";
+  (score > 0 ? board.submit(score).catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : "<li>No scores yet. Merge something!</li>";
+  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+}
+$("again").addEventListener("click", () => { if (isHost()) onReady(net.sessionId); else net.send("ready", { r: 1 }); });
+
+/** Two players picked one color (they joined at once), or a bot has mine: the later sessionId picks another. */
+function fixColor() {
+  const ps = S.entities.players || {}, m = race(), botColors = (m?.bots || []).map((b) => b.c);
+  if (!Object.entries(ps).some(([id, p]) => id < net.sessionId && p.c === myColor) && !botColors.includes(myColor)) return;
+  const taken = new Set([...Object.entries(ps).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c), ...botColors]);
+  myColor = COLORS.find((c) => !taken.has(c)) || myColor;
+  net.me.set("c", myColor);
+}
+
+// ── INPUT ───────────────────────────────────────────────────────────────────────────
+const touchUI = matchMedia("(pointer: coarse)").matches;
+const KEYS = { ArrowLeft: 0, a: 0, ArrowRight: 1, d: 1, ArrowUp: 2, w: 2, ArrowDown: 3, s: 3 };
+addEventListener("keydown", (e) => {
+  const d = KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+  if (d === undefined) return;
+  e.preventDefault(); unlockAudio();
+  myMove(d);
+});
+// Swipe (or drag with the mouse) anywhere: the longer axis picks the direction.
+const swipe = { id: -1, x: 0, y: 0, done: false };
+cv.addEventListener("pointerdown", (e) => { e.preventDefault(); unlockAudio(); Object.assign(swipe, { id: e.pointerId, x: e.clientX, y: e.clientY, done: false }); cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", (e) => {
+  if (e.pointerId !== swipe.id || swipe.done) return;
+  const dx = e.clientX - swipe.x, dy = e.clientY - swipe.y;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < 28) return;
+  swipe.done = true;
+  myMove(Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 0 : 1) : dy < 0 ? 2 : 3);
+});
+for (const ev of ["pointerup", "pointercancel"]) cv.addEventListener(ev, () => { swipe.id = -1; });
+document.addEventListener("touchmove", (e) => { if (!e.target.closest(".card")) e.preventDefault(); }, { passive: false });
+
+// ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
+let lastHb = 0, lastHud = 0, last = 0;
+function frame() {
+  const t = performance.now(), dt = Math.max(0, Math.min(0.05, (t - (last || t)) / 1000));
+  last = t;
+  if (t - lastHb > 1000) { lastHb = t; net.me.set("hb", Date.now()); fixColor(); }
+  if (isHost()) hostTick(Date.now(), t); else host.was = false;
+  const m = race();
+  if (m) myTick(m, t);
+  draw(m, t, dt);
+  if (t - lastHud > 150) { lastHud = t; hud(m); }
+  requestAnimationFrame(frame);
+}
+
+(async function start() {
+  if (ATTRACT) { // the preview: four bots racing from a mid-race board, fast
+    Object.assign(CONFIG, { countdownMs: 200, botMoveMs: 120, botMistake: 0.05, overMs: 3500 });
+    startGrid = [[8, 6, 5, 4], [1, 2, 3, 3], [1, 0, 0, 0], [0, 0, 0, 0]]; // 256 in the corner: 512 is close
+  }
+  net = await connect();
+  net.onState((st) => { S = st; });
+  net.onDisconnect(() => { $("net").textContent = "Reconnecting…"; });
+  net.onReconnect(() => { lastHud = 0; });
+  net.on("ready", (msg, from) => { if (isHost()) onReady(from); });
+  if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
+  const taken = new Set(Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c));
+  myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
+  net.me.set({ n: myName, c: myColor, hb: Date.now() });
+  if (ATTRACT) { writeRace(newRace(1)); host.was = true; }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
