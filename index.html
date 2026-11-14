@@ -18,6 +18,7 @@
   .card h2 { margin: 0 0 6px; font-size: 26px; }
   .card h3 { margin: 12px 0 0; font-size: 12px; letter-spacing: .1em; color: #b3a8e8; }
   .card ol { text-align: left; margin: 8px 0; padding-left: 26px; font-size: 14px; } .card li span { float: right; } .card li.me { color: #ffd23f; font-weight: 700; }
+  .card li.msg { list-style: none; margin-left: -26px; text-align: center; color: #b3a8e8; }
   button.go { width: 100%; min-height: 48px; border: 0; border-radius: 12px; background: #ffd23f; color: #262150; font: 800 17px system-ui, sans-serif; cursor: pointer; margin-top: 8px; }
   #oNext { color: #b3a8e8; font-size: 13px; margin-top: 8px; }
 </style>
@@ -30,7 +31,7 @@
 <div class="hud" id="net">Connecting…</div>
 <div id="over" hidden><div class="card">
   <h2 id="oTitle"></h2><ol id="places"></ol>
-  <h3>BEST SCORE IN ONE RACE</h3><ol id="board"><li>Loading the leaderboard…</li></ol>
+  <h3>BEST SCORE IN ONE RACE</h3><ol id="board"><li class="msg">Loading the leaderboard…</li></ol>
   <button class="go" id="again">Play again</button><div id="oNext"></div>
 </div></div>
 <script>
@@ -585,11 +586,11 @@ function hud(m) {
   overFor = m.id;
   const list = $("board"), score = me.B && me.m === m.id ? me.B.score : 0;
   if (w === net.sessionId) tone(660, 400, "triangle", 0.07);
-  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
-  list.innerHTML = "<li>Loading…</li>";
+  if (!board) { list.innerHTML = '<li class="msg">Leaderboards need a connection.</li>'; return; }
+  list.innerHTML = '<li class="msg">Loading…</li>';
   (score > 0 ? board.submit(score).catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
-    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : "<li>No scores yet. Merge something!</li>";
-  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : '<li class="msg">No scores yet. Merge something!</li>';
+  }).catch(() => { list.innerHTML = '<li class="msg">Couldn\'t load the leaderboard.</li>'; });
 }
 $("again").addEventListener("click", () => { if (isHost()) onReady(net.sessionId); else net.send("ready", { r: 1 }); });
 
@@ -622,6 +623,7 @@ cv.addEventListener("pointermove", (e) => {
   myMove(Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 0 : 1) : dy < 0 ? 2 : 3);
 });
 for (const ev of ["pointerup", "pointercancel"]) cv.addEventListener(ev, () => { swipe.id = -1; });
+cv.addEventListener("contextmenu", (e) => e.preventDefault()); // a right-click drag doesn't open the browser menu
 document.addEventListener("touchmove", (e) => { if (!e.target.closest(".card")) e.preventDefault(); }, { passive: false });
 
 // ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
